@@ -8,6 +8,12 @@ use std::sync::Arc;
 
 /// A dynamic-filter consumer discovered in an execution plan along with the schema its evaluated
 /// against.
+/// A dynamic filter produced by an execution plan.
+#[derive(Clone)]
+pub(crate) struct DiscoveredDynamicFilterProducer {
+    pub(crate) id: u64,
+}
+
 #[derive(Clone)]
 pub(crate) struct DiscoveredDynamicFilter {
     pub(crate) id: u64,
@@ -74,6 +80,55 @@ pub(crate) fn discover_dynamic_filter_consumers(
     Ok(consumers)
 }
 
+/// Finds dynamic-filter producers in `plan`, deduplicated by expression ID.
+///
+/// Producer type is intentionally unrestricted: hash joins, aggregates, sorts, and future
+/// producers are all discovered through [`ExecutionPlan::dynamic_expressions_produced`].
+pub(crate) fn discover_dynamic_filter_producers(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Vec<DiscoveredDynamicFilterProducer>> {
+    let mut producers = HashMap::new();
+    plan.apply(|node| {
+        for expression in node.dynamic_expressions_produced() {
+            if expression
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+                .is_none()
+            {
+                continue;
+            }
+            let Some(id) = expression.expression_id() else {
+                return internal_err!("DynamicFilterPhysicalExpr did not have an expression ID");
+            };
+            producers
+                .entry(id)
+                .or_insert(DiscoveredDynamicFilterProducer { id });
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+
+    let mut producers: Vec<_> = producers.into_values().collect();
+    producers.sort_unstable_by_key(|producer| producer.id);
+    Ok(producers)
+}
+
+/// Finds consumers whose producer does not occur in `plan`.
+///
+/// These consumers become orphaned from their producer when `plan` is moved behind a remote
+/// network boundary, so their expressions must remain discoverable on that boundary.
+pub(crate) fn orphan_dynamic_filter_consumers(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
+    let produced_here: HashSet<_> = discover_dynamic_filter_producers(plan)?
+        .into_iter()
+        .map(|producer| producer.id)
+        .collect();
+    Ok(discover_dynamic_filter_consumers(plan)?
+        .into_iter()
+        .filter(|consumer| !produced_here.contains(&consumer.id))
+        .map(|consumer| consumer.expression)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +170,7 @@ mod tests {
         let discovered = discover_dynamic_filter_consumers(&plan)?;
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].id, dynamic_filter.expression_id().unwrap());
+        assert!(orphan_dynamic_filter_consumers(&plan)?.is_empty());
 
         dynamic_filter
             .downcast_ref::<DynamicFilterPhysicalExpr>()
@@ -156,6 +212,43 @@ mod tests {
 
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].id, dynamic_filter.expression_id().unwrap());
+        Ok(())
+    }
+
+    #[test]
+    fn discovers_producers_without_restricting_execution_plan_type() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let input = Arc::new(EmptyExec::new(schema)) as Arc<dyn ExecutionPlan>;
+        let first = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("a", 0))],
+            lit(true),
+        )) as Arc<dyn PhysicalExpr>;
+        let second = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("a", 0))],
+            lit(true),
+        )) as Arc<dyn PhysicalExpr>;
+
+        let plan = Arc::new(ExpressionExec::new(
+            Arc::new(ExpressionExec::new(
+                Arc::new(ExpressionExec::new(input, Arc::clone(&first), true)),
+                Arc::clone(&second),
+                true,
+            )),
+            Arc::clone(&first),
+            true,
+        )) as Arc<dyn ExecutionPlan>;
+
+        let discovered = discover_dynamic_filter_producers(&plan)?;
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|producer| producer.id)
+                .collect::<Vec<_>>(),
+            vec![
+                first.expression_id().unwrap(),
+                second.expression_id().unwrap()
+            ]
+        );
         Ok(())
     }
 
