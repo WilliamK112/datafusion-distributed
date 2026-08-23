@@ -1,5 +1,6 @@
 #[cfg(all(feature = "integration", test))]
 mod tests {
+    use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::common::Result;
     use datafusion::physical_plan::collect;
     use datafusion_distributed::test_utils::localhost::start_localhost_context;
@@ -124,7 +125,123 @@ mod tests {
     async fn partitioned_dynamic_planning_executes_with_remote_consumers() -> Result<()> {
         let display =
             normalize_runtime_dynamic_filters(execute_local_hash_join(false, true).await?);
-        assert_eq!(display.matches("DynamicFilter [ <runtime> ]").count(), 2);
+        assert_snapshot!(display, @r"
+        ┌───── DistributedExec
+        │ ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+        │   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+        │     CoalescePartitionsExec
+        │       [Stage 3] => NetworkCoalesceExec: output_partitions=3, input_tasks=1
+        └──────────────────────────────────────────────────
+          ┌───── Stage 3 ── tasks=1, partitions=3
+          │ AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+          │   HashJoinExec: mode=Partitioned, join_type=RightSemi, on=[(key@0, RainToday@0)], projection=[]
+          │     AggregateExec: mode=FinalPartitioned, gby=[key@0 as key], aggr=[]
+          │       [Stage 1] => NetworkShuffleExec: output_partitions=3, input_tasks=2
+          │     [Stage 2] => NetworkShuffleExec: output_partitions=3, input_tasks=2
+          └──────────────────────────────────────────────────
+            ┌───── Stage 1 ── tasks=2, partitions=3
+            │ RepartitionExec: partitioning=Hash([key@0], 3), input_partitions=3
+            │   SamplerExec: partitions=3
+            │     AggregateExec: mode=Partial, gby=[key@0 as key], aggr=[]
+            │       DistributedLeafExec:
+            │         t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[RainToday@19 as key], file_type=parquet
+            │         t1: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[RainToday@19 as key], file_type=parquet
+            └──────────────────────────────────────────────────
+            ┌───── Stage 2 ── tasks=2, partitions=3
+            │ RepartitionExec: partitioning=Hash([RainToday@0], 3), input_partitions=3
+            │   SamplerExec: partitions=3
+            │     DistributedLeafExec:
+            │       t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[RainToday], file_type=parquet, predicate=DynamicFilter [ <runtime> ], dynamic_rg_pruning=eligible
+            │       t1: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[RainToday], file_type=parquet, predicate=DynamicFilter [ <runtime> ], dynamic_rg_pruning=eligible
+            └──────────────────────────────────────────────────
+        ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partitioned_remote_union_dynamic_filters() -> Result<()> {
+        let display =
+            normalize_runtime_dynamic_filters(execute_partitioned_remote_union_hash_join().await?);
+        assert_snapshot!(display, @r"
+        ┌───── DistributedExec
+        │ ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+        │   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+        │     CoalescePartitionsExec
+        │       [Stage 3] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
+        └──────────────────────────────────────────────────
+          ┌───── Stage 3 ── tasks=2, partitions=3
+          │ AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+          │   HashJoinExec: mode=Partitioned, join_type=RightSemi, on=[(key@0, key@0)], projection=[]
+          │     AggregateExec: mode=FinalPartitioned, gby=[key@0 as key], aggr=[]
+          │       [Stage 1] => NetworkShuffleExec: output_partitions=3, input_tasks=2
+          │     [Stage 2] => NetworkShuffleExec: output_partitions=3, input_tasks=2
+          └──────────────────────────────────────────────────
+            ┌───── Stage 1 ── tasks=2, partitions=6
+            │ RepartitionExec: partitioning=Hash([key@0], 6), input_partitions=3
+            │   AggregateExec: mode=Partial, gby=[key@0 as key], aggr=[]
+            │     DistributedUnionExec: t0:[c0] t1:[c1]
+            │       DistributedLeafExec:
+            │         t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[RainToday@19 as key], file_type=parquet
+            │       DistributedLeafExec:
+            │         t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[WindGustDir@5 as key], file_type=parquet
+            └──────────────────────────────────────────────────
+            ┌───── Stage 2 ── tasks=2, partitions=6
+            │ RepartitionExec: partitioning=Hash([key@0], 6), input_partitions=3
+            │   DistributedUnionExec: t0:[c0] t1:[c1]
+            │     DistributedLeafExec:
+            │       t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[RainToday@19 as key], file_type=parquet, predicate=DynamicFilter [ <runtime> ], dynamic_rg_pruning=eligible
+            │     DistributedLeafExec:
+            │       t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[WindGustDir@5 as key], file_type=parquet, predicate=DynamicFilter [ <runtime> ], dynamic_rg_pruning=eligible
+            └──────────────────────────────────────────────────
+        ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transitive_remote_dynamic_filters() -> Result<()> {
+        let display = normalize_runtime_dynamic_filters(
+            execute_transitive_remote_dynamic_filter_hash_join().await?,
+        );
+        assert_snapshot!(display, @r"
+        ┌───── DistributedExec
+        │ ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+        │   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+        │     CoalescePartitionsExec
+        │       [Stage 5] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
+        └──────────────────────────────────────────────────
+          ┌───── Stage 5 ── tasks=2, partitions=3
+          │ AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+          │   HashJoinExec: mode=Partitioned, join_type=RightSemi, on=[(key@0, RainToday@0)], projection=[]
+          │     AggregateExec: mode=FinalPartitioned, gby=[key@0 as key], aggr=[]
+          │       [Stage 1] => NetworkShuffleExec: output_partitions=3, input_tasks=2
+          │     [Stage 4] => NetworkShuffleExec: output_partitions=3, input_tasks=2
+          └──────────────────────────────────────────────────
+            ┌───── Stage 1 ── tasks=2, partitions=6
+            │ RepartitionExec: partitioning=Hash([key@0], 6), input_partitions=3
+            │   AggregateExec: mode=Partial, gby=[key@0 as key], aggr=[]
+            │     DistributedLeafExec:
+            │       t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[RainToday@19 as key], file_type=parquet
+            │       t1: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[RainToday@19 as key], file_type=parquet
+            └──────────────────────────────────────────────────
+            ┌───── Stage 4 ── tasks=2, partitions=6
+            │ RepartitionExec: partitioning=Hash([RainToday@0], 6), input_partitions=3
+            │   HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, WindGustDir@0)], projection=[RainToday@2]
+            │     [Stage 2] => NetworkShuffleExec: output_partitions=3, input_tasks=2
+            │     [Stage 3] => NetworkShuffleExec: output_partitions=3, input_tasks=2
+            └──────────────────────────────────────────────────
+              ┌───── Stage 2 ── tasks=2, partitions=6
+              │ RepartitionExec: partitioning=Hash([key@0], 6), input_partitions=3
+              │   DistributedLeafExec:
+              │     t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[WindGustDir@5 as key], file_type=parquet
+              │     t1: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[WindGustDir@5 as key], file_type=parquet
+              └──────────────────────────────────────────────────
+              ┌───── Stage 3 ── tasks=2, partitions=6
+              │ RepartitionExec: partitioning=Hash([WindGustDir@0], 6), input_partitions=3
+              │   DistributedLeafExec:
+              │     t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[WindGustDir, RainToday], file_type=parquet, predicate=DynamicFilter [ <runtime> ], dynamic_rg_pruning=eligible
+              │     t1: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[WindGustDir, RainToday], file_type=parquet, predicate=DynamicFilter [ <runtime> ], dynamic_rg_pruning=eligible
+              └──────────────────────────────────────────────────
+        ");
         Ok(())
     }
 
@@ -198,6 +315,49 @@ mod tests {
         .await
     }
 
+    async fn execute_partitioned_remote_union_hash_join() -> Result<String> {
+        execute_local_query(
+            false,
+            false,
+            true,
+            r#"
+                WITH keys AS (
+                    SELECT "RainToday" AS key FROM weather
+                    UNION ALL
+                    SELECT "WindGustDir" AS key FROM weather
+                )
+                SELECT COUNT(*)
+                FROM (SELECT DISTINCT key FROM keys) build
+                JOIN keys probe ON build.key = probe.key
+            "#,
+        )
+        .await
+    }
+
+    async fn execute_transitive_remote_dynamic_filter_hash_join() -> Result<String> {
+        execute_local_query(
+            false,
+            false,
+            false,
+            r#"
+                SELECT COUNT(*)
+                FROM (
+                    SELECT DISTINCT "RainToday" AS key
+                    FROM weather
+                ) build
+                JOIN (
+                    SELECT probe."RainToday"
+                    FROM (
+                        SELECT "WindGustDir" AS key
+                        FROM weather
+                    ) nested_build
+                    RIGHT JOIN weather probe ON nested_build.key = probe."WindGustDir"
+                ) probe ON build.key = probe."RainToday"
+            "#,
+        )
+        .await
+    }
+
     async fn execute_local_query(
         broadcast_joins: bool,
         dynamic_task_count: bool,
@@ -221,14 +381,25 @@ mod tests {
 
         let plan = ctx.sql(sql).await?.create_physical_plan().await?;
 
-        let results = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+        let results_with_dynamic_filters = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
         assert_eq!(
-            results.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            results_with_dynamic_filters
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
             1
         );
 
-        let original_display = display_plan_ascii(plan.as_ref(), false);
+        set_dynamic_filter_pushdown(&ctx, false);
+        let plan_without_dynamic_filters = ctx.sql(sql).await?.create_physical_plan().await?;
+        let results_without_dynamic_filters =
+            collect(plan_without_dynamic_filters, ctx.task_ctx()).await?;
+        assert_eq!(
+            pretty_format_batches(&results_with_dynamic_filters)?.to_string(),
+            pretty_format_batches(&results_without_dynamic_filters)?.to_string(),
+        );
 
+        let original_display = display_plan_ascii(plan.as_ref(), false);
         let plan_with_dynamic_filters =
             rewrite_distributed_plan_with_dynamic_filters(Arc::clone(&plan)).await?;
         assert_eq!(display_plan_ascii(plan.as_ref(), false), original_display);
@@ -239,5 +410,18 @@ mod tests {
         )
         .await?;
         Ok(display_plan_ascii(plan_with_metrics.as_ref(), false))
+    }
+
+    fn set_dynamic_filter_pushdown(ctx: &datafusion::prelude::SessionContext, enabled: bool) {
+        let state = ctx.state_ref();
+        state
+            .write()
+            .config_mut()
+            .options_mut()
+            .set(
+                "datafusion.optimizer.enable_dynamic_filter_pushdown",
+                &enabled.to_string(),
+            )
+            .expect("static dynamic-filter setting should be valid");
     }
 }
