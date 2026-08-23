@@ -1,7 +1,4 @@
-use crate::common::{
-    TreeNodeExt, element_wise_sum, orphan_dynamic_filter_consumers, vec_avg_reduce, vec_div,
-    vec_mul,
-};
+use crate::common::{TreeNodeExt, element_wise_sum, vec_avg_reduce, vec_div, vec_mul};
 use crate::coordinator::distributed::PreparedPlan;
 use crate::coordinator::query_coordinator::QueryCoordinator;
 use crate::distributed_planner::{
@@ -37,7 +34,6 @@ pub(super) async fn prepare_dynamic_plan(
     let head_stage = inject_network_boundaries(
         Arc::clone(base_plan),
         |mut input_stage: LocalStage, nb_type: TypeId, nb_ctx: &InjectNetworkBoundaryContext| {
-            let dynamic_filter_anchors = orphan_dynamic_filter_consumers(&input_stage.plan)?;
             let mut metrics = MetricsSet::new();
 
             // At this point, input_stage.plan has two kind of leaf nodes:
@@ -130,7 +126,6 @@ pub(super) async fn prepare_dynamic_plan(
                         runtime_stats: stats,
                     }),
                     input_properties,
-                    dynamic_filter_anchors,
                 })
             })
         },

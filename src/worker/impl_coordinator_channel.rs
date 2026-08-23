@@ -222,7 +222,7 @@ fn build_task_completed_dynamic_filters(
     task_ctx: &Arc<datafusion::execution::TaskContext>,
 ) -> Result<TaskCompletedDynamicFilters> {
     let mut filters = vec![];
-    for consumer in discover_dynamic_filter_consumers(plan)? {
+    for consumer in discover_dynamic_filter_consumers(plan)?.consumers {
         // Serializing the complete DynamicFilterPhysicalExpr preserves both its current
         // predicate and its completion state through DataFusion's native proto hook.
         let expression = encode_physical_expr(&consumer.expression, task_ctx)?;
