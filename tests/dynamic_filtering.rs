@@ -197,6 +197,45 @@ mod tests {
         Ok(())
     }
 
+    /// Three union branches over two tasks force one specialized task to own two consumers of the
+    /// same dynamic filter with different column remappings.
+    #[tokio::test]
+    async fn partitioned_remote_union_remaps_each_consumer() -> Result<()> {
+        let display = execute_partitioned_remote_union_multi_consumer_hash_join().await?;
+        assert_snapshot!(display, @r"
+        ┌───── DistributedExec
+        │ ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+        │   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+        │     CoalescePartitionsExec
+        │       [Stage 3] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
+        └──────────────────────────────────────────────────
+          ┌───── Stage 3 ── tasks=2, partitions=3
+          │ AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+          │   HashJoinExec: mode=Partitioned, join_type=RightSemi, on=[(key@0, key@0)], projection=[]
+          │     AggregateExec: mode=FinalPartitioned, gby=[key@0 as key], aggr=[]
+          │       [Stage 1] => NetworkShuffleExec: output_partitions=3, input_tasks=1
+          │     [Stage 2] => NetworkShuffleExec: output_partitions=3, input_tasks=2
+          └──────────────────────────────────────────────────
+            ┌───── Stage 1 ── tasks=1, partitions=6
+            │ RepartitionExec: partitioning=Hash([key@0], 6), input_partitions=3
+            │   AggregateExec: mode=Partial, gby=[key@0 as key], aggr=[]
+            │     DistributedLeafExec:
+            │       t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[RainToday@19 as key], file_type=parquet
+            └──────────────────────────────────────────────────
+            ┌───── Stage 2 ── tasks=2, partitions=6
+            │ RepartitionExec: partitioning=Hash([key@0], 6), input_partitions=6
+            │   DistributedUnionExec: t0:[c0, c2] t1:[c1]
+            │     DistributedLeafExec:
+            │       t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[RainToday@19 as key], file_type=parquet, predicate=DynamicFilter [ CASE hash_repartition % 3 WHEN 1 THEN RainToday@19 >= No AND RainToday@19 <= No AND RainToday@19 IN (SET) ([<values>]) WHEN 2 THEN RainToday@19 >= Yes AND RainToday@19 <= Yes AND RainToday@19 IN (SET) ([Yes]) ELSE false END OR false ], dynamic_rg_pruning=eligible
+            │     DistributedLeafExec:
+            │       t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[WindGustDir@5 as key], file_type=parquet, predicate=DynamicFilter [ CASE hash_repartition % 3 WHEN 1 THEN WindGustDir@5 >= No AND WindGustDir@5 <= No AND WindGustDir@5 IN (SET) ([<values>]) WHEN 2 THEN WindGustDir@5 >= Yes AND WindGustDir@5 <= Yes AND WindGustDir@5 IN (SET) ([Yes]) ELSE false END OR false ], dynamic_rg_pruning=eligible
+            │     DistributedLeafExec:
+            │       t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[WindDir9am@7 as key], file_type=parquet, predicate=DynamicFilter [ CASE hash_repartition % 3 WHEN 1 THEN WindDir9am@7 >= No AND WindDir9am@7 <= No AND WindDir9am@7 IN (SET) ([<values>]) WHEN 2 THEN WindDir9am@7 >= Yes AND WindDir9am@7 <= Yes AND WindDir9am@7 IN (SET) ([Yes]) ELSE false END OR false ], dynamic_rg_pruning=eligible
+            └──────────────────────────────────────────────────
+        ");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn transitive_remote_dynamic_filters() -> Result<()> {
         let display = normalize_runtime_dynamic_filters(
@@ -329,6 +368,30 @@ mod tests {
                 SELECT COUNT(*)
                 FROM (SELECT DISTINCT key FROM keys) build
                 JOIN keys probe ON build.key = probe.key
+            "#,
+        )
+        .await
+    }
+
+    async fn execute_partitioned_remote_union_multi_consumer_hash_join() -> Result<String> {
+        execute_local_query(
+            false,
+            false,
+            true,
+            r#"
+                WITH probe AS (
+                    SELECT "RainToday" AS key FROM weather
+                    UNION ALL
+                    SELECT "WindGustDir" AS key FROM weather
+                    UNION ALL
+                    SELECT "WindDir9am" AS key FROM weather
+                )
+                SELECT COUNT(*)
+                FROM (
+                    SELECT DISTINCT "RainToday" AS key
+                    FROM weather
+                ) build
+                JOIN probe ON build.key = probe.key
             "#,
         )
         .await
