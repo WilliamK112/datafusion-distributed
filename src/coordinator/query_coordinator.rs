@@ -294,7 +294,7 @@ impl<'a> StageCoordinator<'a> {
                         completed_dynamic_filter_store.insert(task_key, filters);
                     }
                     WorkerToCoordinatorMsg::ProducedDynamicFilter(filter) => {
-                        dynamic_filter_registry.update(task_key, *filter);
+                        dynamic_filter_registry.add_partial(task_key, *filter);
                     }
                 }
             }
