@@ -1,4 +1,4 @@
-use crate::codec::decode_physical_expr;
+use crate::codec::{decode_physical_expr, dynamic_filter_update_target};
 use crate::common::discover_dynamic_filter_consumers;
 use crate::coordinator::DistributedExec;
 use crate::execution_plans::DistributedLeafExec;
@@ -6,9 +6,9 @@ use crate::{DistributedCodec, TaskCompletedDynamicFilters, TaskKey};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{HashMap, Result};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::{DeduplicatingProtoConverter, PhysicalPlanNodeExt};
+use datafusion_proto::protobuf::physical_expr_node::ExprType;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use std::sync::Arc;
 
@@ -92,31 +92,29 @@ pub(super) fn apply_reports_to_distributed_leaves(
                 let Some(proto) = updates.get(&consumer.id).copied() else {
                     continue;
                 };
-                let Ok(reported_expression) = decode_physical_expr(
-                    proto,
+                let Some(ExprType::DynamicFilter(reported_dynamic_filter)) =
+                    proto.expr_type.as_ref()
+                else {
+                    continue;
+                };
+                let Some(predicate) = reported_dynamic_filter.inner_expr.as_deref() else {
+                    continue;
+                };
+                let Ok(predicate) = decode_physical_expr(
+                    predicate,
                     consumer.input_schema.as_ref(),
                     task_ctx,
-                )
-                .or_else(|_| {
-                    decode_physical_expr(proto, consumer.expression_schema.as_ref(), task_ctx)
-                }) else {
+                ) else {
                     continue;
                 };
-                let Some(reported_dynamic_filter) =
-                    reported_expression.downcast_ref::<DynamicFilterPhysicalExpr>()
-                else {
+                let Ok(dynamic_filter) = dynamic_filter_update_target(
+                    &consumer.expression,
+                    consumer.input_schema.as_ref(),
+                    task_ctx,
+                ) else {
                     continue;
                 };
-                let Ok(expression) = reported_dynamic_filter.current() else {
-                    continue;
-                };
-                let Some(dynamic_filter) = consumer
-                    .expression
-                    .downcast_ref::<DynamicFilterPhysicalExpr>()
-                else {
-                    continue;
-                };
-                if dynamic_filter.update(expression).is_ok() {
+                if dynamic_filter.update(predicate).is_ok() {
                     dynamic_filter.mark_complete();
                 }
             }
