@@ -8,8 +8,8 @@ use datafusion::common::{HashMap, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::{DeduplicatingProtoConverter, PhysicalPlanNodeExt};
-use datafusion_proto::protobuf::physical_expr_node::ExprType;
 use datafusion_proto::protobuf::PhysicalPlanNode;
+use datafusion_proto::protobuf::physical_expr_node::ExprType;
 use std::sync::Arc;
 
 /// Rewrites an executed distributed plan with the completed dynamic filters reported by its
@@ -100,11 +100,9 @@ pub(super) fn apply_reports_to_distributed_leaves(
                 let Some(predicate) = reported_dynamic_filter.inner_expr.as_deref() else {
                     continue;
                 };
-                let Ok(predicate) = decode_physical_expr(
-                    predicate,
-                    consumer.input_schema.as_ref(),
-                    task_ctx,
-                ) else {
+                let Ok(predicate) =
+                    decode_physical_expr(predicate, consumer.input_schema.as_ref(), task_ctx)
+                else {
                     continue;
                 };
                 let Ok(dynamic_filter) = dynamic_filter_update_target(

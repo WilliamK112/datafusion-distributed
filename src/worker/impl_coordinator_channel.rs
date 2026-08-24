@@ -1,6 +1,4 @@
-use crate::codec::{
-    decode_physical_expr, dynamic_filter_update_target, encode_physical_expr,
-};
+use crate::codec::{decode_physical_expr, dynamic_filter_update_target, encode_physical_expr};
 use crate::common::{
     DiscoveredDynamicFilter, TreeNodeExt, discover_dynamic_filter_consumers,
     discover_dynamic_filter_producers, discover_runtime_dynamic_filter_consumers,
@@ -470,16 +468,7 @@ mod tests {
 
     #[test]
     fn applies_and_completes_a_merged_filter_for_every_consumer() -> Result<()> {
-        let source_schema = Arc::new(Schema::new(vec![Field::new(
-            "key",
-            DataType::Int32,
-            false,
-        )]));
-        let expression_schema = Arc::new(Schema::new(vec![
-            Field::new("unused", DataType::Int32, false),
-            Field::new("first_key", DataType::Int32, false),
-            Field::new("second_key", DataType::Int32, false),
-        ]));
+        let source_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
         let expression = Arc::new(DynamicFilterPhysicalExpr::new(
             vec![Arc::new(Column::new("key", 0))],
             lit(true),
@@ -496,13 +485,11 @@ mod tests {
                     id,
                     expression: Arc::clone(&first),
                     input_schema: Arc::clone(&source_schema),
-                    expression_schema: Arc::clone(&expression_schema),
                 },
                 DiscoveredDynamicFilter {
                     id,
                     expression: Arc::clone(&second),
                     input_schema: Arc::clone(&source_schema),
-                    expression_schema: Arc::clone(&expression_schema),
                 },
             ],
         )]);
@@ -522,8 +509,7 @@ mod tests {
             &task_ctx,
         )?;
 
-        for (consumer, expected) in [(&first, "first_key@1 > 10"), (&second, "second_key@2 > 10")]
-        {
+        for (consumer, expected) in [(&first, "first_key@1 > 10"), (&second, "second_key@2 > 10")] {
             let dynamic_filter = consumer
                 .downcast_ref::<DynamicFilterPhysicalExpr>()
                 .unwrap();
