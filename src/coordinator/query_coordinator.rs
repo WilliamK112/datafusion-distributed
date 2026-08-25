@@ -1,5 +1,7 @@
 use crate::codec::{decode_execution_plan, encode_execution_plan};
-use crate::common::{TreeNodeExt, now_ns, task_ctx_with_extension};
+use crate::common::{
+    TreeNodeExt, has_nonlocal_dynamic_filter_relationships, now_ns, task_ctx_with_extension,
+};
 use crate::config_extension_ext::get_config_extension_propagation_headers;
 use crate::coordinator::latency_metric::LatencyMetric;
 use crate::coordinator::{CompletedDynamicFilterStore, MetricsStore};
@@ -48,7 +50,7 @@ pub(super) struct QueryCoordinator {
     metrics: ExecutionPlanMetricsSet,
     coordinator_to_worker_metrics: CoordinatorToWorkerMetrics,
     metrics_store: Option<Arc<MetricsStore>>,
-    completed_dynamic_filter_store: Arc<CompletedDynamicFilterStore>,
+    completed_dynamic_filter_store: Option<Arc<CompletedDynamicFilterStore>>,
     end_stream_notifier: Arc<Notify>,
     join_set: Mutex<JoinSet<Result<()>>>,
 }
@@ -59,7 +61,7 @@ impl QueryCoordinator {
         task_ctx: Arc<TaskContext>,
         metrics_set: &ExecutionPlanMetricsSet,
         metrics_store: Option<Arc<MetricsStore>>,
-        completed_dynamic_filter_store: Arc<CompletedDynamicFilterStore>,
+        completed_dynamic_filter_store: Option<Arc<CompletedDynamicFilterStore>>,
     ) -> Self {
         Self {
             task_ctx,
@@ -132,7 +134,7 @@ pub(super) struct StageCoordinator<'a> {
     metrics_set: &'a ExecutionPlanMetricsSet,
     metrics: &'a CoordinatorToWorkerMetrics,
     metrics_store: &'a Option<Arc<MetricsStore>>,
-    completed_dynamic_filter_store: &'a Arc<CompletedDynamicFilterStore>,
+    completed_dynamic_filter_store: &'a Option<Arc<CompletedDynamicFilterStore>>,
     end_stream_notifier: &'a Arc<Notify>,
     join_set: &'a Mutex<JoinSet<Result<()>>>,
 }
@@ -243,7 +245,7 @@ impl<'a> StageCoordinator<'a> {
             task_number: task_i,
         };
         let task_metrics = self.metrics_store.clone();
-        let completed_dynamic_filter_store = Arc::clone(self.completed_dynamic_filter_store);
+        let completed_dynamic_filter_store = self.completed_dynamic_filter_store.clone();
         let (load_info_tx, load_info_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut load_info_tx_opt = Some(load_info_tx);
 
@@ -267,13 +269,16 @@ impl<'a> StageCoordinator<'a> {
                         let _ = load_info_tx_opt.take();
                     }
                     WorkerToCoordinatorMsg::TaskCompletedDynamicFilters(filters) => {
-                        completed_dynamic_filter_store.insert(task_key, filters);
+                        if let Some(store) = &completed_dynamic_filter_store {
+                            store.insert(task_key, filters);
+                        }
                     }
                 }
             }
-            if completed_dynamic_filter_store.get(&task_key).is_none() {
-                completed_dynamic_filter_store
-                    .insert(task_key, TaskCompletedDynamicFilters::default());
+            if let Some(store) = &completed_dynamic_filter_store
+                && store.get(&task_key).is_none()
+            {
+                store.insert(task_key, TaskCompletedDynamicFilters::default());
             }
         });
         load_info_rx
@@ -399,7 +404,11 @@ impl<'a> StageCoordinator<'a> {
 
             Ok(Transformed::no(plan))
         })?;
-        Ok((transformed.data, work_unit_feed_declarations))
+        let plan = maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
+            Arc::clone(&transformed.data),
+            self.task_ctx,
+        )?;
+        Ok((plan, work_unit_feed_declarations))
     }
 
     /// Returns as many URLs as the task count for the stage this [StageCoordinator]
@@ -425,6 +434,43 @@ impl<'a> StageCoordinator<'a> {
             );
         }
         Ok(routed.urls)
+    }
+}
+
+// We must take care to avoid partial dynamic filter updates when sending an
+// in-memory plan.
+//
+// Consider this partitioned hash join topology where the consumer task is
+// collocated with one producer on worker A:
+// ```text
+// Worker A
+//
+// Stage 2 Task 0
+// HashJoinExec <- Dynamic Filter Produced: (foo > 100)
+//
+// Stage 1 Task 0
+// DataSourceExec <- consumer
+//
+// Worker B
+// Stage 2 Task 1
+// HashJoinExec <- Dynamic Filter Produced: (foo != 150)
+// ```
+//
+// The in-process transport alows the Worker A join to propagate its filter to
+// the consumer and mark is as completed, so the consumer incorrectly applies
+// (foo > 100) instead of (foo > 100 OR foo != 150).
+//
+// In this situation, we rountrip Stage 1 Task 0 to sever the in-memory
+// relationship. The dynamic filter update from the producer must reach the
+// coordinator for merging prior to being forwarded to the consumer.
+fn maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: &Arc<TaskContext>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if has_nonlocal_dynamic_filter_relationships(&plan)? {
+        roundtrip_pb(plan, task_ctx)
+    } else {
+        Ok(plan)
     }
 }
 

@@ -12,7 +12,7 @@ use crate::{
 };
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result, exec_datafusion_err, internal_err};
-use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::{SessionStateBuilder, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
 use datafusion_proto::protobuf::physical_expr_node::ExprType;
@@ -62,6 +62,7 @@ impl Worker {
             let d_cfg = DistributedConfig::from_config_options(cfg.options())?;
             let shuffle_batch_size = d_cfg.shuffle_batch_size;
             let collect_metrics = d_cfg.collect_metrics;
+            let collect_dynamic_filters = d_cfg.collect_dynamic_filters;
             if shuffle_batch_size != 0 {
                 cfg = cfg.with_batch_size(shuffle_batch_size);
             }
@@ -95,6 +96,10 @@ impl Worker {
                 task_ctx,
                 metrics_tx: match collect_metrics {
                     true => Arc::new(std::sync::Mutex::new(Some(metrics_tx))),
+                    false => Arc::new(std::sync::Mutex::new(None)),
+                },
+                dynamic_filters_tx: match collect_dynamic_filters {
+                    true => Arc::new(std::sync::Mutex::new(Some(dynamic_filters_tx))),
                     false => Arc::new(std::sync::Mutex::new(None)),
                 },
                 task_data_metrics: Arc::new(TaskDataMetrics::new(request.query_start_time_ns)),
@@ -162,7 +167,8 @@ impl Worker {
             }
 
             let metrics_tx = task_data.metrics_tx.lock().unwrap().take();
-            let mut dynamic_filters = TaskCompletedDynamicFilters::default();
+            let dynamic_filters_tx = task_data.dynamic_filters_tx.lock().unwrap().take();
+            let mut dynamic_filters = None;
             if let Some(Ok(plan)) = task_data.final_plan.get() {
                 let d_ctx = DistributedTaskContext {
                     task_index: key.task_number,
@@ -173,10 +179,16 @@ impl Worker {
                 if let Some(metrics_tx) = metrics_tx {
                     send_metrics_via_channel(metrics_tx, plan, d_ctx, task_data_metrics);
                 }
-                dynamic_filters = build_task_completed_dynamic_filters(plan, &task_data.task_ctx)
-                    .unwrap_or_default();
+                if dynamic_filters_tx.is_some() {
+                    dynamic_filters = Some(
+                        build_task_completed_dynamic_filters(plan, &task_data.task_ctx)
+                            .unwrap_or_default(),
+                    );
+                }
             }
-            let _ = dynamic_filters_tx.send(dynamic_filters);
+            if let Some(dynamic_filters_tx) = dynamic_filters_tx {
+                let _ = dynamic_filters_tx.send(dynamic_filters.unwrap_or_default());
+            }
             task_data_entries.invalidate(&key).await
         });
 
@@ -219,24 +231,22 @@ impl Worker {
 
 fn build_task_completed_dynamic_filters(
     plan: &Arc<dyn ExecutionPlan>,
-    task_ctx: &Arc<datafusion::execution::TaskContext>,
+    task_ctx: &Arc<TaskContext>,
 ) -> Result<TaskCompletedDynamicFilters> {
     let mut filters = vec![];
     for consumer in discover_dynamic_filter_consumers(plan)? {
-        // Serializing the complete DynamicFilterPhysicalExpr preserves both its current
-        // predicate and its completion state through DataFusion's native proto hook.
+        // Serializing the DynamicFilterPhysicalExpr preserves its current predicate and
+        // generation through DataFusion's native proto hook.
         let expression = encode_physical_expr(&consumer.expression, task_ctx)?;
-        let Some(ExprType::DynamicFilter(dynamic_filter)) = expression.expr_type.as_ref() else {
+        let Some(ExprType::DynamicFilter(_)) = expression.expr_type.as_ref() else {
             return internal_err!("discovered dynamic filter did not serialize as one");
         };
-        // A cancelled or short-circuited task can leave filters incomplete. Do not report those
-        // as final values for display.
-        if dynamic_filter.is_complete {
-            filters.push(TaskDynamicFilter {
-                expression_id: consumer.id,
-                expression,
-            });
-        }
+        // This message describes the filters when the task completed; an expression itself may
+        // remain incomplete because aggregate dynamic filters do not call `mark_complete`.
+        filters.push(TaskDynamicFilter {
+            expression_id: consumer.id,
+            expression,
+        });
     }
     Ok(TaskCompletedDynamicFilters { filters })
 }

@@ -132,7 +132,9 @@ fn create_distributed_plan(
             }
             let plan = push_fetch_into_network_coalesce(plan)?;
             return Ok(Arc::new(
-                DistributedExec::new(plan).with_metrics_collection(d_cfg.collect_metrics),
+                DistributedExec::new(plan)
+                    .with_metrics_collection(d_cfg.collect_metrics)
+                    .with_dynamic_filter_collection(d_cfg.collect_dynamic_filters),
             ));
         }
 
@@ -151,7 +153,9 @@ fn create_distributed_plan(
         if d_cfg.dynamic_task_count {
             // The task count will be decided dynamically at execution time.
             return Ok(Arc::new(
-                DistributedExec::new(plan).with_metrics_collection(d_cfg.collect_metrics),
+                DistributedExec::new(plan)
+                    .with_metrics_collection(d_cfg.collect_metrics)
+                    .with_dynamic_filter_collection(d_cfg.collect_dynamic_filters),
             ));
         }
 
@@ -168,7 +172,9 @@ fn create_distributed_plan(
         let plan = push_fetch_into_network_coalesce(plan)?;
 
         Ok(Arc::new(
-            DistributedExec::new(plan).with_metrics_collection(d_cfg.collect_metrics),
+            DistributedExec::new(plan)
+                .with_metrics_collection(d_cfg.collect_metrics)
+                .with_dynamic_filter_collection(d_cfg.collect_dynamic_filters),
         ))
     })
 }

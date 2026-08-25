@@ -8,11 +8,13 @@ use datafusion::common::{HashMap, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion_proto::physical_plan::{DeduplicatingProtoConverter, PhysicalPlanNodeExt};
 use datafusion_proto::protobuf::PhysicalPlanNode;
+use datafusion_proto::protobuf::physical_expr_node::ExprType;
 use std::sync::Arc;
 
-/// Rewrites an executed distributed plan with the completed dynamic filters reported by its
+/// Rewrites an executed distributed plan with the dynamic filters reported by its completed
 /// worker tasks.
 ///
 /// When composing this with [`crate::rewrite_distributed_plan_with_metrics`], dynamic filters must
@@ -24,16 +26,19 @@ pub async fn rewrite_distributed_plan_with_dynamic_filters(
         return Ok(plan);
     };
 
+    let Some(reports) = distributed_exec.wait_for_dynamic_filters().await? else {
+        return Ok(plan);
+    };
     let plan_for_viz = distributed_exec.plan_for_viz()?;
     let task_ctx = distributed_exec.task_ctx()?;
-    let reports = distributed_exec.wait_for_dynamic_filters().await?;
-    let plan_for_viz = isolate_distributed_leaf_variants_for_display(plan_for_viz, &task_ctx)?;
+    let plan_for_viz = prepare_dynamic_filter_plan_for_display(plan_for_viz, &task_ctx)?;
     apply_reports_to_distributed_leaves(&plan_for_viz, &reports, &task_ctx);
     distributed_exec.with_rewritten_plan(plan_for_viz)
 }
 
-/// Replaces the variants in the visualization plan with independent per-task copies.
-pub(super) fn isolate_distributed_leaf_variants_for_display(
+/// Builds a visualization-only plan with independent consumer variants and no displayed producer
+/// state.
+pub(super) fn prepare_dynamic_filter_plan_for_display(
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: &Arc<TaskContext>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -53,7 +58,9 @@ pub(super) fn isolate_distributed_leaf_variants_for_display(
                     &codec,
                     &converter,
                 )?;
-                proto.try_into_physical_plan_with_converter(task_ctx, &codec, &converter)
+                let variant =
+                    proto.try_into_physical_plan_with_converter(task_ctx, &codec, &converter)?;
+                sanitize_sort_dynamic_filters_for_display(variant)
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -61,6 +68,22 @@ pub(super) fn isolate_distributed_leaf_variants_for_display(
             Arc::clone(leaf.original()),
             variants,
         )?) as Arc<dyn ExecutionPlan>))
+    })
+    .and_then(|transformed| sanitize_sort_dynamic_filters_for_display(transformed.data))
+}
+
+/// Detaches dynamic-filter-producing sorts from execution state. A reset sort has a `true`
+/// predicate, which DataFusion intentionally omits from its display output.
+///
+/// See <https://github.com/datafusion-contrib/datafusion-distributed/issues/677>.
+fn sanitize_sort_dynamic_filters_for_display(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_up(|node| {
+        if node.is::<SortExec>() && !node.dynamic_expressions_produced().is_empty() {
+            return Ok(Transformed::yes(node.reset_state()?));
+        }
+        Ok(Transformed::no(node))
     })
     .map(|transformed| transformed.data)
 }
@@ -92,6 +115,10 @@ pub(super) fn apply_reports_to_distributed_leaves(
                 let Some(proto) = updates.get(&consumer.id).copied() else {
                     continue;
                 };
+                let Some(ExprType::DynamicFilter(dynamic_filter_proto)) = proto.expr_type.as_ref()
+                else {
+                    continue;
+                };
                 let Ok(reported_expression) =
                     decode_physical_expr(proto, consumer.input_schema.as_ref(), task_ctx)
                 else {
@@ -111,8 +138,8 @@ pub(super) fn apply_reports_to_distributed_leaves(
                 else {
                     continue;
                 };
-                if dynamic_filter.update(expression).is_ok() {
-                    dynamic_filter.mark_complete();
+                if dynamic_filter_proto.generation > 1 {
+                    let _ = dynamic_filter.update(expression);
                 }
             }
         }
@@ -126,13 +153,14 @@ mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::logical_expr::Operator;
-    use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_expr::expressions::{
         BinaryExpr, Column, DynamicFilterPhysicalExpr, lit,
     };
+    use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
     use datafusion::physical_plan::displayable;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::filter::FilterExec;
+    use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::prelude::SessionContext;
     use uuid::Uuid;
 
@@ -155,7 +183,7 @@ mod tests {
         )?) as Arc<dyn ExecutionPlan>;
 
         let task_ctx = SessionContext::new().task_ctx();
-        let isolated = isolate_distributed_leaf_variants_for_display(leaf, &task_ctx)?;
+        let isolated = prepare_dynamic_filter_plan_for_display(leaf, &task_ctx)?;
         let expression =
             Arc::new(BinaryExpr::new(column, Operator::Gt, lit(10_i32))) as Arc<dyn PhysicalExpr>;
         dynamic_filter
@@ -191,6 +219,38 @@ mod tests {
             .to_string();
         assert!(task_0.contains("DynamicFilter [ a@0 > 10 ]"));
         assert!(task_1.contains("DynamicFilter [ empty ]"));
+        Ok(())
+    }
+
+    #[test]
+    fn visualization_omits_sort_producer_filter_without_mutating_original() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let input = Arc::new(EmptyExec::new(schema)) as Arc<dyn ExecutionPlan>;
+        let ordering =
+            LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))])
+                .unwrap();
+        let sort =
+            Arc::new(SortExec::new(ordering, input).with_fetch(Some(10))) as Arc<dyn ExecutionPlan>;
+        let produced = sort.dynamic_expressions_produced();
+        let dynamic_filter = produced[0]
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .unwrap();
+        dynamic_filter.update(Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Gt,
+            lit(10_i32),
+        )))?;
+
+        let original_display = displayable(sort.as_ref()).one_line().to_string();
+        assert!(original_display.contains("filter=[a@0 > 10]"));
+
+        let sanitized = sanitize_sort_dynamic_filters_for_display(Arc::clone(&sort))?;
+        let sanitized_display = displayable(sanitized.as_ref()).one_line().to_string();
+        assert!(!sanitized_display.contains("filter=["));
+        assert_eq!(
+            displayable(sort.as_ref()).one_line().to_string(),
+            original_display
+        );
         Ok(())
     }
 }
